@@ -1,0 +1,26 @@
+# ── Sensitive files ──────────────────────────────────────────
+.env                  # Never commit your API key
+.claude/
+.codex
+
+# ── Python cache ─────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+*.log
+
+# ── Virtual environment ───────────────────────────────────────
+venv/
+.venv/
+env/
+
+# ── Generated output ──────────────────────────────────────────
+output/               # Generated markdown documents (user-specific)
+chroma_db/
+logs/
+
+# ── IDE ───────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp

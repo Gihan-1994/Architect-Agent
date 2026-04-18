@@ -1,0 +1,39 @@
+# ─────────────────────────────────────────────────────────────
+# Software Architect Agent — Python Dependencies
+# ─────────────────────────────────────────────────────────────
+#
+# Install with:
+#   pip install -r requirements.txt
+#
+# Python version: 3.10+
+
+# ── LangChain core ──────────────────────────────────────────
+langchain>=0.3.0                # Core LLM abstractions, tool binding, message types
+langchain-core>=0.3.0           # BaseMessage, HumanMessage, AIMessage, ToolMessage, @tool
+langchain-community>=0.3.0      # Chroma vector store integration (langchain_community.vectorstores)
+langchain-text-splitters>=0.3.0 # RecursiveCharacterTextSplitter
+
+# ── Google Gemini integration ────────────────────────────────
+langchain-google-genai>=2.0.0   # ChatGoogleGenerativeAI — connects LangChain to Gemini
+
+# ── Vector memory (Lab 4 stack) ──────────────────────────────
+chromadb>=0.5.0                 # Vector database — persists embeddings to disk
+sentence-transformers>=3.0.0    # Loads all-MiniLM-L6-v2 embedding model
+langchain-huggingface>=0.1.0    # HuggingFaceEmbeddings — LangChain wrapper for sentence-transformers
+langchain-chroma>=0.1.0         # Updated Chroma integration (replaces langchain-community Chroma)
+
+# ── Google Gemini SDK ─────────────────────────────────────────
+google-generativeai>=0.8.0      # Legacy Gemini SDK — used for model listing (diagnostic)
+google-genai>=1.0.0             # New official Gemini SDK (replaces google-generativeai)
+
+# ── Web UI ───────────────────────────────────────────────────
+gradio>=4.0.0                   # Zero-config chat web interface (runs at localhost:7860)
+
+# ── Environment management ───────────────────────────────────
+python-dotenv>=1.0.0            # Loads GOOGLE_API_KEY from .env file
+
+# ── CLI interaction ──────────────────────────────────────────
+questionary>=2.0.0              # Interactive arrow-key terminal selection menu
+
+# ── Token counting ───────────────────────────────────────────
+tiktoken>=0.5.0                 # OpenAI tokenizer for accurate token budgeting

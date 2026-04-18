@@ -1,0 +1,309 @@
+# Clear ChromaDB Command Design
+
+**Created**: 2026-04-18  
+**Status**: Planned  
+**Related**: `agent/vector_memory.py`, `agent/dispatcher.py`, `main.py`
+
+---
+
+## Overview
+
+Implement a `/clear_db` CLI command that:
+1. Clears all indexed documents from ChromaDB storage
+2. Re-indexes all `.md` files in the output directory on restart
+
+---
+
+## Execution Flow
+
+```
+User: /clear_db
+    ↓
+main.py: handle_command("/clear_db")
+    ↓
+dispatcher.clear_vector_memory()
+    │
+    ├─ vm.clear() → Delete chroma_db/ contents
+    │     │
+    │     ├─ Close ChromaDB connection
+    │     ├─ Delete persist_dir files
+    │     └─ Reset singleton
+    │
+    └─ Return {"files_deleted": count}
+    ↓
+dispatcher.reindex_documents()
+    │
+    ├─ Get save_path from tools.get_save_path()
+    ├─ Scan output/*.md files
+    ├─ For each file:
+    │     ├─ Read file content
+    │     ├─ vm.index_document(content, filename)
+    │     └─ Log progress
+    │
+    └─ Return {"documents": count, "chunks": total}
+    ↓
+Log: "Cleared and re-indexed X documents (Y chunks)"
+```
+
+---
+
+## Files to Modify
+
+| File | Changes | Location |
+|------|---------|----------|
+| `agent/vector_memory.py` | Add `clear()` method | After `has_documents()` (~line 350) |
+| `agent/dispatcher.py` | Add `clear_vector_memory()` and `reindex_documents()` | After `get_exact_token_count()` |
+| `agent/__init__.py` | Export new functions | Add to imports and `__all__` |
+| `main.py` | Add `/clear_db` handler | In `handle_command()` function |
+
+---
+
+## Implementation Details
+
+### 1. `agent/vector_memory.py` — `clear()` Method
+
+**Pseudocode**:
+```python
+def clear(self) -> dict:
+    """
+    Delete all indexed documents and reset ChromaDB.
+    
+    Returns:
+        {"files_deleted": int, "path": str, "success": bool}
+    
+    Side effects:
+        - Deletes all files in persist_dir
+        - Resets self._store to None (forces re-initialization on next use)
+    """
+    # Step 1: Close existing connection
+    if self._store is not None:
+        # ChromaDB doesn't have explicit close, but we can reset
+        self._store = None
+    
+    # Step 2: Delete all files in persist directory
+    import shutil
+    files_deleted = 0
+    if os.path.exists(self.persist_dir):
+        for filename in os.listdir(self.persist_dir):
+            file_path = os.path.join(self.persist_dir, filename)
+            if os.path.isfile(file_path):
+                os.remove(file_path)
+                files_deleted += 1
+            elif os.path.isdir(file_path):
+                shutil.rmtree(file_path)
+                files_deleted += 1
+    
+    # Step 3: Recreate empty directory
+    os.makedirs(self.persist_dir, exist_ok=True)
+    
+    return {
+        "files_deleted": files_deleted,
+        "path": self.persist_dir,
+        "success": True
+    }
+```
+
+**Logging**:
+```
+[INFO] vector_memory.clear → ChromaDB cleared (files_deleted=3)
+```
+
+---
+
+### 2. `agent/dispatcher.py` — `clear_vector_memory()` Function
+
+**Pseudocode**:
+```python
+def clear_vector_memory() -> dict:
+    """
+    Clear all indexed documents from ChromaDB.
+    
+    Call this when user runs /clear_db command.
+    
+    Returns:
+        {"files_deleted": int, "success": bool}
+    """
+    global _architect
+    
+    logger.info("Clearing ChromaDB storage")
+    
+    from .vector_memory import get_vector_memory
+    vm = get_vector_memory()
+    result = vm.clear()
+    
+    logger.info(f"ChromaDB cleared", extra={"files_deleted": result["files_deleted"]})
+    
+    return result
+```
+
+---
+
+### 3. `agent/dispatcher.py` — `reindex_documents()` Function
+
+**Pseudocode**:
+```python
+def reindex_documents() -> dict:
+    """
+    Re-index all saved .md documents in the output directory.
+    
+    Call this after clear_vector_memory() to restore document context.
+    
+    Returns:
+        {"documents": int, "chunks": int, "success": bool}
+    
+    Raises:
+        ValueError: If save_path is not set
+    """
+    global _architect
+    
+    logger.info("Re-indexing documents from output directory")
+    
+    # Step 1: Get save path
+    from .tools import get_save_path
+    save_path = get_save_path()
+    
+    if not save_path or not os.path.exists(save_path):
+        logger.warning("Save path not set or does not exist")
+        return {"documents": 0, "chunks": 0, "success": False}
+    
+    # Step 2: Find all .md files
+    md_files = [f for f in os.listdir(save_path) if f.endswith(".md")]
+    
+    if not md_files:
+        logger.info("No documents found to re-index")
+        return {"documents": 0, "chunks": 0, "success": True}
+    
+    # Step 3: Re-index each document
+    from .vector_memory import get_vector_memory
+    vm = get_vector_memory()
+    
+    total_chunks = 0
+    indexed_count = 0
+    
+    for filename in md_files:
+        file_path = os.path.join(save_path, filename)
+        
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            
+            # Skip the header comment line (generated by agent)
+            if content.startswith("<!-- Generated by"):
+                content = content.split("\n\n", 1)[-1]
+            
+            chunks = vm.index_document(content, source_filename=filename)
+            total_chunks += chunks
+            indexed_count += 1
+            
+            logger.debug(f"Re-indexed {filename}", extra={"chunks": chunks})
+            
+        except Exception as e:
+            logger.warning(f"Failed to re-index {filename}: {e}")
+    
+    logger.info(f"Re-index completed", extra={"documents": indexed_count, "chunks": total_chunks})
+    
+    return {
+        "documents": indexed_count,
+        "chunks": total_chunks,
+        "success": True
+    }
+```
+
+---
+
+### 4. `agent/__init__.py` — Export Functions
+
+**Changes**:
+```python
+from .dispatcher import (
+    agentic_action, 
+    reset_conversation, 
+    get_token_estimate, 
+    get_exact_token_count, 
+    init_architect, 
+    switch_model,
+    clear_vector_memory,      # NEW
+    reindex_documents,         # NEW
+)
+
+__all__ = [
+    # ... existing exports ...
+    "clear_vector_memory",     # NEW
+    "reindex_documents",       # NEW
+]
+```
+
+---
+
+### 5. `main.py` — Command Handler
+
+**Location**: In `handle_command()` function, add new case after `/clear`
+
+**Pseudocode**:
+```python
+elif cmd_lower == "/clear_db":
+    print("🗑️  Clearing ChromaDB storage...")
+    
+    clear_result = clear_vector_memory()
+    print(f"   Deleted {clear_result['files_deleted']} database files")
+    
+    print("📚 Re-indexing documents...")
+    reindex_result = reindex_documents()
+    
+    if reindex_result['success']:
+        print(f"   Re-indexed {reindex_result['documents']} documents ({reindex_result['chunks']} chunks)")
+    else:
+        print(f"   ⚠️ No documents found to re-index")
+    
+    print()
+    return True
+```
+
+---
+
+## Edge Cases
+
+| Scenario | Behavior |
+|----------|----------|
+| ChromaDB locked/in use | Python handles file deletion gracefully; may need retry on Windows |
+| Output directory empty | Return `{"documents": 0, "chunks": 0, "success": True}` |
+| Save path not set | Log warning, return `{"success": False}` |
+| One file fails indexing | Continue with others, log warning for failed file |
+| Very large documents | May take 1-2 seconds per document (normal) |
+
+---
+
+## Verification
+
+### Manual Testing
+
+1. Start agent: `python main.py`
+2. Create a document: "Create system design for food delivery"
+3. Verify indexed: Check logs show "Indexed X chunks"
+4. Run `/clear_db`
+5. Verify cleared: Check logs show "Deleted X files"
+6. Verify re-indexed: Check logs show "Re-indexed 1 documents"
+7. Query about document: Should find RAG context now
+
+### Expected Output
+
+```
+You: /clear_db
+🗑️  Clearing ChromaDB storage...
+   Deleted 3 database files
+📚 Re-indexing documents...
+   Re-indexed 2 documents (46 chunks)
+```
+
+---
+
+## Implementation Checklist
+
+- [ ] `agent/vector_memory.py` — Add `clear()` method
+- [ ] `agent/dispatcher.py` — Add `clear_vector_memory()` function
+- [ ] `agent/dispatcher.py` — Add `reindex_documents()` function  
+- [ ] `agent/__init__.py` — Export new functions
+- [ ] `main.py` — Add `/clear_db` command handler
+- [ ] Test: Clear with documents present
+- [ ] Test: Clear with empty output directory
+- [ ] Update `CHANGES.md` with implementation notes
