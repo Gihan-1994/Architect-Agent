@@ -1,5 +1,5 @@
 # ── Sensitive files ──────────────────────────────────────────
-.env                  # Never commit your API key
+.env
 .claude/
 .codex
 
@@ -16,7 +16,7 @@ venv/
 env/
 
 # ── Generated output ──────────────────────────────────────────
-output/               # Generated markdown documents (user-specific)
+output/
 chroma_db/
 logs/
 
