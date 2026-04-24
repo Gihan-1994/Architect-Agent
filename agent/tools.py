@@ -8,9 +8,9 @@ WHY TOOLS EXIST:
   can discover and invoke it.
 
 TOOLS IN THIS FILE:
-  1. save_document    → Writes a markdown file to the user's chosen folder
-                        AND indexes it in the vector store (long-term memory)
-  2. list_documents   → Lists all .md files previously saved
+  1. save_document    → Writes a new markdown file AND indexes it in vector store
+  2. update_document  → Updates an existing file AND re-indexes it
+  3. list_documents   → Lists all .md files previously saved
 
 HOW THE LLM CALLS TOOLS:
   1. LLM receives the tool schemas (name, description, parameters)
@@ -19,9 +19,9 @@ HOW THE LLM CALLS TOOLS:
   4. The result is sent back to the LLM as a ToolMessage
   5. LLM generates its final response, now knowing the tool succeeded
 
-VECTOR MEMORY INTEGRATION (NEW):
-  After every successful file save, save_document() now also calls
-  vector_memory.index_document(). This is the "write path" of our RAG system.
+VECTOR MEMORY INTEGRATION:
+  After every successful file save/update, the document is indexed in ChromaDB.
+  This is the "write path" of our RAG system.
   Every document that lands on disk also lands in ChromaDB — automatically,
   with no extra action required from the LLM or the user.
 """
@@ -59,6 +59,19 @@ def set_save_path(path: str) -> None:
 def get_save_path() -> str:
     """Return the current save path (used by app.py for display)."""
     return _save_path
+
+
+def get_existing_documents() -> list[str]:
+    """
+    Return list of existing .md filenames in save_path.
+
+    Used by list_documents tool and for checking if a document exists
+    before deciding to create vs update.
+    """
+    global _save_path
+    if not os.path.exists(_save_path):
+        return []
+    return sorted([f for f in os.listdir(_save_path) if f.endswith(".md")])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -160,3 +173,81 @@ def list_documents() -> str:
         lines.append(f"  • {fname}  ({size_kb:.1f} KB)")
 
     return "\n".join(lines)
+
+
+@tool
+def update_document(filename: str, content: str) -> str:
+    """
+    Update an existing markdown document.
+
+    Use this tool when the user asks to UPDATE, MODIFY, or REVISE a document
+    that already exists.
+
+    IMPORTANT: Only call this for documents that already exist.
+    For new documents, use save_document instead.
+
+    Args:
+        filename: The existing file name (e.g., 'system-design.md').
+                  Must match an existing file exactly.
+        content: The FULL updated markdown content (not just the new section).
+
+    Returns:
+        Confirmation with file path and re-index status.
+    """
+    global _save_path
+    start_time = time.time()
+
+    logger.info("update_document called", extra={"saved_file": filename})
+
+    # 1. Check if file exists
+    # Normalize filename to match how files are saved
+    clean_name = filename.strip().replace(" ", "-").lower()
+    if not clean_name.endswith(".md"):
+        clean_name += ".md"
+
+    full_path = os.path.join(_save_path, clean_name)
+
+    if not os.path.exists(full_path):
+        logger.warning(f"File not found: {clean_name}")
+        existing = get_existing_documents()
+        if existing:
+            return f"❌ File not found: {clean_name}\n\nExisting documents:\n" + "\n".join(f"  • {f}" for f in existing) + "\n\nUse save_document to create a new file."
+        else:
+            return f"❌ File not found: {clean_name}. No documents exist yet. Use save_document to create a new file."
+
+    # 2. Write updated content
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        header = f"<!-- Updated by Software Architect Agent | {timestamp} -->\n\n"
+        write_start = time.time()
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(header + content)
+        write_duration = int((time.time() - write_start) * 1000)
+        logger.info(f"File written: {clean_name}", extra={"duration_ms": write_duration})
+    except Exception as e:
+        logger.error(f"Failed to write file: {e}")
+        return f"❌ Failed to write file: {str(e)}"
+
+    # 3. Re-index in vector store (delete old chunks, add new)
+    try:
+        vm = get_vector_memory()
+        deleted = vm.delete_by_source(clean_name)
+        if deleted < 0:
+            logger.warning(f"Delete failed for {clean_name}, proceeding with index")
+        chunks = vm.index_document(content, source_filename=clean_name)
+        logger.info(f"Re-indexed {clean_name}", extra={
+            "chunks_deleted": deleted,
+            "chunks_added": chunks,
+        })
+        index_note = f" | Re-indexed ({deleted} old → {chunks} new chunks)"
+    except Exception as e:
+        logger.error(f"Re-indexing failed: {e}")
+        index_note = f" | ⚠️ Re-indexing failed: {str(e)}"
+
+    total_duration = int((time.time() - start_time) * 1000)
+    logger.info("update_document completed", extra={
+        "saved_file": clean_name,
+        "duration_ms": total_duration,
+    })
+
+    return f"✅ Document updated: {os.path.abspath(full_path)}{index_note}"

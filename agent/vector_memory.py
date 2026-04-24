@@ -66,17 +66,26 @@ HOW THE TWO MEMORY LAYERS WORK TOGETHER:
   Together they give Gemini:
     - Conversational flow from the sliding window
     - Deep document knowledge from the vector store
+
+DISTANCE METRIC: COSINE (0-1 range)
+  - 0 = identical vectors
+  - 1 = opposite vectors
+  - Lower score = more similar (intuitive for threshold tuning)
+  - IMPORTANT: ChromaDB cannot change metric after collection creation.
+    Use reset_collection() to migrate from L2 to cosine.
 """
 
 import os
 import time
 import logging
+import shutil
 from typing import List
 
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter, TokenTextSplitter
 from langchain_core.documents import Document
+from chromadb.api import CreateCollectionConfiguration
 
 logger = logging.getLogger(__name__)
 
@@ -253,90 +262,6 @@ class VectorMemory:
             # Silently fail — long-term memory is a bonus, not a requirement
             return []
 
-    def similarity_search_with_score(
-        self,
-        query: str,
-        k: int = 10,
-        distance_threshold: float = 1.3,
-    ) -> List[tuple]:
-        """
-        Find chunks with their similarity scores, filtering by relevance threshold.
-
-        ChromaDB returns L2 distance scores for normalized embeddings.
-        Lower score = more similar.
-
-        L2 distance → cosine similarity conversion:
-            d=0.55 → cos_sim=0.85 (very similar)
-            d=1.0  → cos_sim=0.5  (moderately similar)
-            d=1.2  → cos_sim=0.28 (somewhat related - recommended default)
-            d=1.5  → cos_sim=-0.125 (looser matching)
-
-        Args:
-            query: The user's message to search for.
-            k: Maximum chunks to retrieve.
-            distance_threshold: Maximum L2 distance to consider relevant.
-                                Default 1.2 (cosine similarity > 0.28).
-
-        Returns:
-            List of (Document, score) tuples where score <= distance_threshold.
-            Empty list if no chunks pass threshold OR ChromaDB not initialized.
-        """
-        start_time = time.time()
-        query_preview = query[:30] + "..." if len(query) > 30 else query
-        logger.debug(f"similarity_search called: '{query_preview}'")
-
-        # Step 1: Ensure ChromaDB is initialized (lazy load)
-        try:
-            store = self._get_store()
-        except Exception as e:
-            logger.warning(f"ChromaDB initialization failed: {e}")
-            return []
-
-        # Step 2: Check if store has any documents
-        try:
-            count = store._collection.count()
-        except Exception as e:
-            logger.warning(f"ChromaDB collection access failed: {e}")
-            count = 0
-
-        if count == 0:
-            logger.debug("ChromaDB collection is empty, no RAG context available")
-            return []
-
-        logger.debug(f"Searching {count} indexed chunks")
-
-        # Step 3: Perform similarity search with scores
-        try:
-            search_start = time.time()
-            results = store.similarity_search_with_score(query, k=k)
-            search_duration = int((time.time() - search_start) * 1000)
-
-            # Debug logging for threshold tuning
-            for doc, score in results:
-                source = doc.metadata.get("source", "unknown")
-                logger.debug("Chunk found", extra={"source": source, "score": round(score, 3)})
-
-            # Filter by relevance threshold
-            filtered = [(doc, score) for doc, score in results if score <= distance_threshold]
-
-            passed = len(filtered)
-            skipped = len(results) - passed
-
-            if skipped > 0:
-                logger.debug(f"Threshold filtering: {passed} passed, {skipped} skipped (threshold={distance_threshold})")
-
-            for doc, score in filtered:
-                source = doc.metadata.get("source", "unknown")
-                logger.debug("Relevant chunk", extra={"source": source, "score": round(score, 3)})
-
-            total_duration = int((time.time() - start_time) * 1000)
-            logger.info("similarity_search completed", extra={"duration_ms": total_duration, "results": len(filtered), "threshold": distance_threshold})
-
-            return filtered
-        except Exception as e:
-            logger.warning(f"ChromaDB similarity search failed: {e}")
-            return []
-
     def format_context(self, docs: List[Document]) -> str:
         """
         Format retrieved chunks into a single string for the LLM prompt.
@@ -378,25 +303,286 @@ class VectorMemory:
         except Exception:
             return False
 
+    def reset_collection(self, new_space: str = "cosine") -> dict:
+        """
+        Clear existing collection and recreate with new distance metric.
+
+        WARNING: This deletes all indexed documents! Use only when switching
+        distance metrics (e.g., from L2 to cosine).
+
+        Use case: ChromaDB cannot change distance metric after collection creation.
+        To switch from L2 to cosine, you must delete and recreate the collection.
+
+        Args:
+            new_space: Distance metric ("cosine", "l2", "ip").
+                       Default "cosine" for intuitive 0-1 range.
+
+        Returns:
+            {"success": bool, "chunks_deleted": int, "new_space": str}
+        """
+        start_time = time.time()
+        logger.info("reset_collection called", extra={"new_space": new_space})
+
+        # Get current store (may be None if not yet loaded)
+        try:
+            if self._store is None:
+                self._store = Chroma(
+                    collection_name="architect_docs",
+                    embedding_function=self._embeddings,
+                    persist_directory=self.persist_dir,
+                )
+
+            old_count = self._store._collection.count()
+        except Exception as e:
+            logger.warning(f"Could not get old collection count: {e}")
+            old_count = 0
+
+        # Delete the collection via API
+        try:
+            client = self._store._client
+            client.delete_collection("architect_docs")
+            logger.info(f"Deleted collection 'architect_docs' via API ({old_count} chunks)")
+        except Exception as e:
+            logger.warning(f"API delete failed (collection may not exist): {e}")
+
+        # Clear the reference
+        self._store = None
+
+        # CRITICAL: Delete the persist_directory on disk
+        # ChromaDB stores collection metadata (including distance metric) in files.
+        # API deletion alone doesn't remove these files, so recreating loads old config.
+        try:
+            if os.path.exists(self.persist_dir):
+                shutil.rmtree(self.persist_dir)
+                logger.info(f"Deleted persist_directory: {self.persist_dir}")
+            os.makedirs(self.persist_dir, exist_ok=True)
+        except Exception as e:
+            logger.error(f"Failed to delete persist_directory: {e}")
+            return {"success": False, "chunks_deleted": old_count, "new_space": new_space}
+
+        # Recreate with new configuration (fresh directory = fresh config)
+        try:
+            self._store = Chroma(
+                collection_name="architect_docs",
+                embedding_function=self._embeddings,
+                persist_directory=self.persist_dir,
+                collection_configuration=CreateCollectionConfiguration(
+                    hnsw={"space": new_space}
+                ),
+            )
+            duration = int((time.time() - start_time) * 1000)
+            logger.info(f"Created new collection with {new_space} distance", extra={
+                "chunks_deleted": old_count,
+                "duration_ms": duration,
+            })
+            return {"success": True, "chunks_deleted": old_count, "new_space": new_space}
+        except Exception as e:
+            logger.error(f"Failed to create new collection: {e}")
+            return {"success": False, "chunks_deleted": old_count, "new_space": new_space}
+
+    def similarity_search_mmr_with_score(
+        self,
+        query: str,
+        k: int = 5,
+        fetch_k: int = 20,
+        lambda_mult: float = 0.5,
+        filter: dict | None = None,
+    ) -> List[tuple]:
+        """
+        Search using MMR - balances similarity + diversity, WITH scores.
+
+        WHY MMR?
+          Standard similarity search returns chunks that are all similar to
+          EACH OTHER (redundant). MMR selects chunks that are:
+            - Similar to the query (relevant)
+            - Different from each other (diverse coverage)
+
+        WHY SCORES ARE NEEDED:
+          MMR alone returns List[Document] without scores.
+          We need scores for:
+            1. Relevance filtering (discard chunks below threshold)
+            2. Token budget management (stop when budget exhausted)
+            3. Observability (log how relevant results were)
+
+        Args:
+            query: Search query
+            k: Number of results to return (default 5)
+            fetch_k: Number to fetch before MMR selection (default 20)
+            lambda_mult: 0 = max diversity, 1 = max similarity (default 0.5)
+            filter: Metadata filter (e.g., {"source": "system-design.md"})
+
+        Returns:
+            List of (Document, cosine_score) tuples.
+            Cosine score: 0 = identical, 1 = opposite (lower = more similar)
+        """
+        start_time = time.time()
+        query_preview = query[:50] + "..." if len(query) > 50 else query
+        logger.debug(f"MMR search: '{query_preview}'")
+
+        try:
+            store = self._get_store()
+
+            # Check if collection is empty
+            if store._collection.count() == 0:
+                return []
+
+            # SIMPLIFIED APPROACH: Use similarity search with scores first
+            # This provides scores for filtering while MMR provides diversity
+            # ChromaDB's max_marginal_relevance_search doesn't return scores,
+            # so we combine: MMR for selection + similarity search for scores
+
+            # Step 1: Get MMR-selected documents (diverse)
+            mmr_docs = store.max_marginal_relevance_search(
+                query=query,
+                k=k,
+                fetch_k=fetch_k,
+                lambda_mult=lambda_mult,
+                filter=filter,
+            )
+
+            if not mmr_docs:
+                return []
+
+            # Step 2: Get scores for those same documents
+            # Re-run similarity search with larger k to capture scores
+            all_results = store.similarity_search_with_score(
+                query=query,
+                k=fetch_k,
+                filter=filter,
+            )
+
+            # Step 3: Match MMR docs with their scores
+            mmr_with_scores = []
+            mmr_contents = {doc.page_content for doc in mmr_docs}
+
+            for doc, score in all_results:
+                if doc.page_content in mmr_contents:
+                    mmr_with_scores.append((doc, score))
+
+            # If matching failed, fall back to regular results
+            if not mmr_with_scores:
+                logger.debug("MMR score matching failed, using regular similarity")
+                return all_results[:k]
+
+            duration = int((time.time() - start_time) * 1000)
+            sources = [d.metadata.get("source", "unknown") for d, s in mmr_with_scores]
+            scores = [round(s, 3) for d, s in mmr_with_scores]
+
+            logger.info("MMR search completed", extra={
+                "duration_ms": duration,
+                "results": len(mmr_with_scores),
+                "lambda_mult": lambda_mult,
+                "sources": sources,
+                "scores": scores,
+            })
+
+            return mmr_with_scores
+
+        except Exception as e:
+            logger.warning(f"MMR search failed: {e}")
+            # Fallback to regular similarity search with scores
+            try:
+                return self._get_store().similarity_search_with_score(query, k=k)[:k]
+            except Exception:
+                return []
+
+    def search_by_source(
+        self,
+        query: str,
+        source_filename: str,
+        k: int = 5,
+    ) -> List[tuple]:
+        """
+        Search only within a specific document using metadata filtering.
+
+        Use case: When user asks about a specific document, we can filter
+        to only retrieve chunks from that document.
+
+        Args:
+            query: Search query
+            source_filename: Filename to filter (e.g., "system-design.md")
+            k: Number of results (default 5)
+
+        Returns:
+            Chunks from only the specified document, with scores
+        """
+        return self.similarity_search_mmr_with_score(
+            query=query,
+            k=k,
+            filter={"source": source_filename},
+        )
+
+    def delete_by_source(self, source_filename: str) -> int:
+        """
+        Delete all chunks from a specific document before re-indexing.
+
+        Use case: When updating a document, we delete old chunks first,
+        then re-index the new content.
+
+        Args:
+            source_filename: The filename to delete (e.g., "system-design.md")
+
+        Returns:
+            Number of chunks deleted, or -1 on error
+        """
+        start_time = time.time()
+        logger.info(f"delete_by_source called: {source_filename}")
+
+        try:
+            store = self._get_store()
+
+            # Get all IDs for this source
+            results = store.get(
+                where={"source": source_filename},
+            )
+
+            if not results.get("ids"):
+                logger.debug(f"No chunks found for {source_filename}")
+                return 0
+
+            ids_to_delete = results["ids"]
+
+            # Delete by IDs
+            store.delete(ids=ids_to_delete)
+
+            duration = int((time.time() - start_time) * 1000)
+            logger.info(f"Deleted {len(ids_to_delete)} chunks for {source_filename}", extra={
+                "chunks_deleted": len(ids_to_delete),
+                "duration_ms": duration,
+            })
+            return len(ids_to_delete)
+
+        except Exception as e:
+            logger.error(f"Failed to delete chunks for {source_filename}: {e}")
+            return -1
+
     # ─────────────────────────────────────────────────────────────────────────
     # Private helpers
     # ─────────────────────────────────────────────────────────────────────────
 
     def _get_store(self) -> Chroma:
         """
-        Lazy-load ChromaDB.
+        Lazy-load ChromaDB with cosine distance metric.
 
         Why lazy? Loading ChromaDB and the embedding model takes a few
         seconds. We only pay this cost the first time a document is saved
         or searched, not at agent startup.
+
+        Why cosine? Cosine distance ranges from 0 (identical) to 1 (opposite),
+        making thresholds easier to tune than L2 distance (unbounded range).
         """
         if self._store is None:
             # If persist_dir already has data, Chroma loads it automatically.
             # If it is empty, Chroma creates a fresh collection.
+            # IMPORTANT: Cosine distance only works on NEW collections.
+            # Existing collections with L2 distance need reset_collection() first.
             self._store = Chroma(
-                collection_name="architect_docs",   # logical grouping name
+                collection_name="architect_docs",
                 embedding_function=self._embeddings,
                 persist_directory=self.persist_dir,
+                collection_configuration=CreateCollectionConfiguration(
+                    hnsw={"space": "cosine"}
+                ),
             )
         return self._store
 

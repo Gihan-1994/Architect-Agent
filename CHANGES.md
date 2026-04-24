@@ -2,6 +2,162 @@
 
 ---
 
+## [2026-04-25] LangGraph Integration Master Plan
+
+---
+
+### 1. `docs/langgraph-master-plan.md` — Comprehensive implementation plan
+
+- **Why:** Needed to integrate findings from four separate planning documents into a unified roadmap:
+  - search-improvement-plan.md (MMR, cosine distance, update_document - already implemented)
+  - metadata-enhanced-retrieval.md (8-field metadata schema - planned)
+  - advanced-retrieval-feasibility.md (semantic chunking, hierarchical retrieval - planned)
+  - langgraph-integration-feasibility.md (Self-RAG, HITL - planned)
+- **How:**
+  - Created master plan with 4 phases:
+    - Phase 1: Vector Memory Enhancement (semantic chunking + metadata) - 2-3 days
+    - Phase 2: Hierarchical Retrieval (optional) - 1-2 days
+    - Phase 3: LangGraph Self-RAG (orchestration layer) - 2-3 days
+    - Phase 4: Dispatcher + UI Integration (HITL) - 1-2 days
+  - Identified dead code that will be removed:
+    - architect.py: `_build_augmented_message()` (replaced by LangGraph retrieve_node)
+    - architect.py: Manual ReAct loop (lines 266-301) (replaced by LangGraph graph)
+    - architect.py: `_count_rag_tokens()` (duplicate of vector_memory `_count_tokens`)
+    - dispatcher.py: `_select_agent()` (single agent, no routing needed)
+    - dispatcher.py: `_simplify_instruction()` (LangGraph handles this)
+  - Created file change matrix showing lines added/removed/modified per file
+  - Identified duplicate code: token counting, context formatting, message pruning
+  - Created dependency graph for implementation order
+  - Added rollback plan per phase
+  - Defined success metrics: retrieval precision 60-80%, query retries < 2 avg
+
+---
+
+### 2. `docs/langgraph-integration-feasibility.md` — LangGraph evaluation
+
+- **Why:** User asked to evaluate LangGraph for Self-Reflective RAG and Human-in-the-Loop features.
+- **How:**
+  - Analyzed current manual ReAct loop limitations
+  - Evaluated Self-RAG feasibility: HIGH (use StateGraph with retrieve-grade-rewrite loop)
+  - Evaluated HITL feasibility: HIGH (use interrupt() + Command(resume) pattern)
+  - Evaluated state replacement: MEDIUM (optional, keep SlidingWindowMemory as wrapper)
+  - Documented state schema (ArchitectState TypedDict)
+  - Provided complete code examples from Context7 documentation
+  - Created migration complexity analysis
+
+---
+
+## [2026-04-21] Advanced Retrieval Features Feasibility Analysis
+
+---
+
+### 1. `docs/advanced-retrieval-feasibility.md` — Feasibility analysis for 3 features
+
+- **Why:** User proposed three architectural upgrades for the RAG system.
+- **How:**
+  - Feature 1 (Semantic Chunking): HIGH feasibility - use MarkdownHeaderTextSplitter
+  - Feature 2 (Hierarchical Retrieval): MEDIUM feasibility - custom HierarchicalVectorMemory class
+  - Feature 3 (GraphRAG): LOW feasibility - deferred (scope mismatch for structured markdown)
+  - Provided complete implementation code for semantic chunking
+  - Provided ChromaDB capability analysis for hierarchical retrieval
+  - Explained why GraphRAG is not recommended for this project (markdown structure already provides relationships)
+
+---
+
+### 2. `docs/metadata-enhanced-retrieval.md` — Metadata strategy
+
+- **Why:** User asked about using metadata for chunk storage to improve retrieval filtering.
+- **How:**
+  - Designed 8-field metadata schema: source, document_title, section, subsection, chunk_type, chunk_index, token_count, heading_level
+  - Documented ChromaDB metadata filtering operators: $and, $or, $gt, $lt, $gte, $lte
+  - Provided metadata extraction functions from markdown
+  - Added metadata-filtered search methods: search_by_section, search_by_document, search_with_chunk_type_preference
+  - Created query intent detection for dynamic filtering
+
+---
+
+## [2026-04-19] Search Algorithm Improvement & Document Update Capability
+
+---
+
+### 1. `agent/vector_memory.py` — MMR search + cosine distance + migration
+
+- **Why:** The user reported two issues:
+  1. Unsuitable answers (redundant chunks returned, not diverse coverage)
+  2. Creates new documents instead of updating existing ones
+- **Root cause analysis:**
+  - Used `similarity_search_with_score` (pure vector similarity → redundant chunks)
+  - L2 distance metric (unbounded range → hard to tune thresholds)
+  - No MMR (no diversity consideration)
+  - No `update_document` tool existed
+- **How:**
+  - Added `CreateCollectionConfiguration` import for explicit distance metric config
+  - Updated `_get_store()` to use cosine distance (0-1 range, intuitive thresholds)
+  - Added `reset_collection()` method for migrating from L2 to cosine (ChromaDB cannot change metric after creation)
+  - Added `similarity_search_mmr_with_score()` — MMR search that returns scores for token budgeting
+  - Added `search_by_source()` — metadata filtering to search specific documents
+  - Added `delete_by_source()` — delete chunks before re-indexing (for updates)
+  - All new methods have comprehensive error handling and logging
+
+---
+
+### 2. `agent/dispatcher.py` — Migration utilities
+
+- **Why:** ChromaDB cannot change distance metric after collection creation. To switch from L2 to cosine, must delete and recreate the collection.
+- **How:**
+  - Added `reset_vector_memory()` — clears ChromaDB and recreates with cosine distance
+  - Added `reindex_all_documents()` — scans output/*.md files and re-indexes them after migration
+  - Both functions return detailed status dicts for user feedback
+
+---
+
+### 3. `agent/architect.py` — Three-pass RAG filtering + update tool binding
+
+- **Why:** Improve search quality through diverse coverage and ensure agent can update existing documents.
+- **How:**
+  - Imported `update_document` from tools
+  - Updated SYSTEM_PROMPT with TOOL USAGE RULES:
+    - `save_document()` for CREATE/GENERATE/WRITE
+    - `update_document()` for UPDATE/MODIFY/REVISE
+    - Call `list_documents()` first to check existing documents
+  - Updated DOCUMENT UPDATE BEHAVIOR section
+  - Bound `update_document` to agent's tool list
+  - Rewrote `_build_augmented_message()` with three-pass filtering:
+    - Pass 1: MMR search (diverse candidates)
+    - Pass 2: Cosine score threshold (filter irrelevant chunks)
+    - Pass 3: Token budget filtering (stop when budget exhausted)
+  - Added observability metrics: `mmr_duration_ms`, `chunks_selected`, `chunks_rejected_by_score`, `chunks_rejected_by_budget`, `tokens`
+
+---
+
+### 4. `agent/tools.py` — update_document tool + helper function
+
+- **Why:** Agent had no way to update existing documents, always created new ones.
+- **How:**
+  - Updated module docstring to include `update_document` in tools list
+  - Added `get_existing_documents()` helper — returns list of existing .md filenames
+  - Added `update_document` tool:
+    - Checks if file exists (returns error if not, with list of existing docs)
+    - Writes updated content with "Updated by..." header
+    - Re-indexes: deletes old chunks, adds new chunks
+    - Returns confirmation with re-index status
+  - All operations have error handling and logging
+
+---
+
+### 5. `docs/search-improvement-plan.md` — Implementation plan
+
+- **Why:** Document the design decisions and implementation steps for future reference.
+- **How:**
+  - Created comprehensive plan document with:
+    - Context and root cause analysis
+    - AI engineering audit findings (distance metric migration, MMR scores, intent detection removal)
+    - Detailed implementation steps with code snippets
+    - Verification plan and test cases
+    - Observability metrics
+
+---
+
 ## [2026-04-18] Structured JSON Logging
 
 ---

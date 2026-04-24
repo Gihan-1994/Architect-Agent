@@ -60,7 +60,7 @@ from typing import List
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, ToolMessage, AIMessage, SystemMessage, BaseMessage
 from .memory import SlidingWindowMemory
-from .tools import save_document, list_documents
+from .tools import save_document, list_documents, update_document
 from .vector_memory import get_vector_memory
 from google import genai
 
@@ -135,9 +135,20 @@ DOCUMENT QUALITY STANDARDS:
 - Include concrete examples (sample JSON, table column definitions, etc.)
 
 TOOL USAGE RULES:
-- When the user asks to CREATE, GENERATE, WRITE, or DESIGN a document → call save_document()
+- When the user asks to CREATE, GENERATE, WRITE, or DESIGN a NEW document → call save_document()
+- When the user asks to UPDATE, MODIFY, REVISE, or CHANGE an existing document → call update_document()
 - When the user asks to LIST, SHOW, or VIEW saved documents → call list_documents()
-- Always confirm to the user after saving (the tool returns the file path)
+
+IMPORTANT - WHEN NOT TO USE TOOLS:
+- When the user asks a QUESTION about existing content (e.g., "What's inside X?", "Summarize X", "Explain the architecture") → DO NOT call any tool! Just answer using the RAG context provided.
+- You receive RELEVANT CONTEXT from previously saved documents. Use this to answer questions directly.
+- Only create/update documents when the user EXPLICITLY asks you to write or modify a file.
+
+DOCUMENT CREATION/UPDATE:
+- Before creating a new document, consider if an existing one should be updated instead
+- When updating, include the FULL updated document content (not just the new section)
+- Preserve the document's overall structure unless explicitly asked to restructure
+- Always confirm to the user after saving/updating (the tool returns the file path)
 - Pick a descriptive, hyphenated filename (e.g., 'ecommerce-system-design', 'auth-api-spec')
 
 COMMUNICATION STYLE:
@@ -179,7 +190,7 @@ class SoftwareArchitectAgent:
         # ── Tool Setup ─────────────────────────────────────────────────────
         # bind_tools() attaches the tool schemas to the LLM so it knows
         # what tools exist and how to call them
-        self._tools = [save_document, list_documents]
+        self._tools = [save_document, list_documents, update_document]
         self._llm_with_tools = self.llm.bind_tools(self._tools)
 
         # Build a quick lookup: tool name → callable
@@ -496,40 +507,71 @@ class SoftwareArchitectAgent:
 
     def _build_augmented_message(self, user_message: str) -> str:
         """
-        Two-Pass Filtering: Relevance + Budget.
+        Three-Pass Filtering: MMR Search + Relevance + Budget.
 
-        Pass 1: Filter chunks by similarity score (skip irrelevant garbage)
-        Pass 2: Add chunks until token budget reached
+        Pass 1: MMR search (diverse candidates with scores)
+        Pass 2: Filter by cosine score threshold (discard irrelevant chunks)
+        Pass 3: Add chunks until token budget exhausted
+
+        WHY MMR?
+          Standard similarity search returns chunks that are all similar to
+          EACH OTHER (redundant). MMR selects chunks that are:
+            - Similar to the query (relevant)
+            - Different from each other (diverse coverage)
 
         Args:
             user_message: The original user input.
 
         Returns:
-            The augmented message string, or the original if nothing relevant found.
+            Augmented message with relevant context, or original if nothing found.
         """
         # Only search if the vector store has at least one indexed document
         if not self._vector_memory.has_documents():
             return user_message
 
-        # Pass 1: Fetch with scores + relevance filtering
-        # ChromaDB L2 distance: lower score = more similar
-        results = self._vector_memory.similarity_search_with_score(
-            user_message,
+        mmr_start = time.time()
+
+        # Pass 1: MMR search with scores
+        results = self._vector_memory.similarity_search_mmr_with_score(
+            query=user_message,
             k=10,
-            distance_threshold=1.3,  # L2 distance threshold (higher = looser)
-            # L2 distance → cosine similarity conversion for normalized embeddings:
-            #   d=0.55 → cos_sim=0.85 (very similar, too strict)
-            #   d=1.0  → cos_sim=0.5  (moderately similar)
-            #   d=1.2  → cos_sim=0.28 (somewhat related - recommended)
-            #   d=1.5  → cos_sim=-0.125 (looser matching)
+            fetch_k=30,  # Fetch more candidates for MMR to choose from
+            lambda_mult=0.5,  # Balanced similarity/diversity
         )
 
-        # No relevant chunks found — don't waste tokens on empty context block
+        mmr_duration = int((time.time() - mmr_start) * 1000)
+
         if not results:
-            logger.debug("No relevant chunks found for query")
+            logger.debug("No MMR results found")
             return user_message
 
-        # Budget constants
+        # Pass 2: Relevance filtering (cosine score threshold)
+        # Cosine distance: 0 = identical, 1 = opposite
+        # Lower score = more similar
+        # 0.85 threshold: balances relevance recall vs precision
+        # all-MiniLM-L6-v2 model produces scores 0.4-0.8 for similar content
+        # 0.85 allows relevant chunks while filtering truly irrelevant (> 0.9)
+        COSINE_THRESHOLD = 0.85
+
+        relevant_chunks = []
+        for doc, score in results:
+            if score < COSINE_THRESHOLD:
+                source = doc.metadata.get("source", "unknown")
+                logger.debug(f"Relevant chunk: {source} (score={score:.3f})")
+                relevant_chunks.append((doc, score))
+            else:
+                logger.debug(f"Filtered out: score {score:.3f} >= threshold {COSINE_THRESHOLD}")
+
+        if not relevant_chunks:
+            logger.debug("No chunks passed relevance threshold")
+            return user_message
+
+        logger.info(f"MMR + relevance filter: {len(relevant_chunks)}/{len(results)} chunks passed", extra={
+            "mmr_duration_ms": mmr_duration,
+            "chunks_rejected_by_score": len(results) - len(relevant_chunks),
+        })
+
+        # Pass 3: Token budget filtering
         MAX_RAG_TOKENS = 2500
         SAFETY_MARGIN = 0.10
         EFFECTIVE_LIMIT = int(MAX_RAG_TOKENS * (1 - SAFETY_MARGIN))  # 2250 tokens
@@ -538,53 +580,43 @@ class SoftwareArchitectAgent:
         selected_chunks = []
         total_tokens = 0
 
-        # Helper function: count tokens with fallback for unusual text
         def count_tokens(text: str) -> int:
-            """Count tokens with graceful fallback for unusual text."""
+            """Count tokens with graceful fallback."""
             try:
                 import tiktoken
                 enc = tiktoken.get_encoding("cl100k_base")
                 return len(enc.encode(text))
             except ImportError:
-                # Fallback: character-based estimate (1 token ≈ 4 chars)
                 return len(text) // 4
-            except Exception as e:
-                # Fallback for unusual text (binary, malformed unicode)
-                logger.warning(f"tiktoken encoding failed: {e}")
+            except Exception:
                 return len(text) // 4
 
-        # Pass 2: Budget filtering
-        for doc, score in results:
+        for doc, score in relevant_chunks:
             chunk_tokens = count_tokens(doc.page_content)
             source = doc.metadata.get("source", "unknown")
 
             # Edge case: oversized chunk (indicates splitter issue)
-            # Option C: Allow but log warning
             if chunk_tokens > MAX_CHUNK_TOKENS:
                 logger.warning(
                     f"Oversized chunk detected: {source} ({chunk_tokens} tokens > {MAX_CHUNK_TOKENS}). "
-                    f"This may indicate TokenTextSplitter configuration issue. "
-                    f"Chunk will be included if budget allows."
+                    f"This may indicate TokenTextSplitter configuration issue."
                 )
 
             if total_tokens + chunk_tokens > EFFECTIVE_LIMIT:
-                logger.debug(f"Budget exhausted at {total_tokens} tokens, stopping")
+                logger.debug(f"Token budget exhausted at {total_tokens} tokens")
                 break
 
             logger.debug(f"Adding chunk: {source} ({chunk_tokens} tokens, score {score:.3f})")
             selected_chunks.append(doc)
             total_tokens += chunk_tokens
 
-        # No chunks fit within budget
         if not selected_chunks:
             logger.debug("No chunks fit within token budget")
             return user_message
 
         # Gemini verification: only when approaching budget limit
-        # (tiktoken approximates; Gemini tokenizer differs)
-        # This triggers when ~4+ chunks of 500 tokens each are selected
         if total_tokens > 2000:
-            logger.debug(f"Near budget limit ({total_tokens}), verifying with Gemini count_tokens")
+            logger.debug(f"Near budget limit ({total_tokens}), verifying with Gemini")
             try:
                 client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
                 context_str = self._vector_memory.format_context(selected_chunks)
@@ -593,7 +625,6 @@ class SoftwareArchitectAgent:
                     contents=[{"parts": [{"text": context_str}]}]
                 ).total_tokens
 
-                # Remove chunks if exact count exceeds limit
                 while exact_count > MAX_RAG_TOKENS and selected_chunks:
                     removed = selected_chunks.pop()
                     logger.debug(f"Removed chunk to fit budget: {removed.metadata.get('source')}")
@@ -604,7 +635,7 @@ class SoftwareArchitectAgent:
                     ).total_tokens
                 total_tokens = exact_count
             except Exception as e:
-                logger.debug(f"Gemini verification failed: {e}, using tiktoken estimate")
+                logger.debug(f"Gemini verification failed: {e}")
 
         # Format selected chunks
         context_str = self._vector_memory.format_context(selected_chunks)
@@ -615,5 +646,15 @@ class SoftwareArchitectAgent:
             f"{context_str}\n\n"
             f"USER REQUEST:\n{user_message}"
         )
+
+        total_duration = int((time.time() - mmr_start) * 1000)
+        logger.info("RAG completed", extra={
+            "duration_ms": total_duration,
+            "mmr_duration_ms": mmr_duration,
+            "chunks_selected": len(selected_chunks),
+            "chunks_rejected_by_score": len(results) - len(relevant_chunks),
+            "chunks_rejected_by_budget": len(relevant_chunks) - len(selected_chunks),
+            "tokens": total_tokens,
+        })
 
         return augmented

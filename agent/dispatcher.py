@@ -37,8 +37,11 @@ AGENT REGISTRY (future extension):
     3. Add the routing logic in agentic_action()
 """
 
+import os
 import time
 import logging
+import subprocess
+import sys
 from typing import Optional
 from .architect import SoftwareArchitectAgent
 
@@ -174,8 +177,6 @@ def agentic_action(user_message: str) -> str:
         >>> print(response)
         "I've created the system design document for your food delivery app ..."
     """
-    import os
-
     start_time = time.time()
 
     # Log entry (truncate message for privacy, show first 50 chars)
@@ -357,3 +358,194 @@ def get_exact_token_count() -> dict:
         "system_prompt": 0,
         "method": "fallback"
     }
+
+
+def reset_vector_memory() -> dict:
+    """
+    Reset ChromaDB collection with cosine distance metric.
+
+    WARNING: This deletes all indexed documents!
+
+    Use case: ChromaDB cannot change distance metric after collection creation.
+    To switch from L2 to cosine, you must delete and recreate the collection.
+
+    NOTE: Runs in a subprocess to properly close SQLite connections.
+    ChromaDB's SQLite connection cannot be closed within the same Python process,
+    causing "readonly database" errors when recreating after deletion.
+
+    Returns:
+        {"success": bool, "chunks_deleted": int, "new_space": str}
+    """
+    import subprocess
+    import sys
+
+    logger.info("reset_vector_memory called (subprocess isolation)")
+
+    # Run reset in subprocess to ensure SQLite connection is fully closed
+    script = '''
+import os
+import shutil
+from langchain_chroma import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
+from chromadb.api import CreateCollectionConfiguration
+
+# Use current working directory (set by subprocess.run cwd)
+persist_dir = os.path.join(os.getcwd(), "chroma_db")
+
+# Step 1: Get old count (if collection exists)
+old_count = 0
+try:
+    embeddings = HuggingFaceEmbeddings(
+        model_name="all-MiniLM-L6-v2",
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True},
+    )
+    store = Chroma(
+        collection_name="architect_docs",
+        embedding_function=embeddings,
+        persist_directory=persist_dir,
+    )
+    old_count = store._collection.count()
+except Exception:
+    pass  # Collection may not exist
+
+# Step 2: Delete persist_directory entirely
+if os.path.exists(persist_dir):
+    shutil.rmtree(persist_dir)
+os.makedirs(persist_dir, exist_ok=True)
+
+# Step 3: Create fresh collection with cosine
+embeddings = HuggingFaceEmbeddings(
+    model_name="all-MiniLM-L6-v2",
+    model_kwargs={"device": "cpu"},
+    encode_kwargs={"normalize_embeddings": True},
+)
+store = Chroma(
+    collection_name="architect_docs",
+    embedding_function=embeddings,
+    persist_directory=persist_dir,
+    collection_configuration=CreateCollectionConfiguration(hnsw={"space": "cosine"}),
+)
+
+print(f"success: True, chunks_deleted: {old_count}, new_space: cosine")
+'''
+
+    try:
+        # Get project root directory (dispatcher.py is in agent/ folder)
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) or os.getcwd()
+
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            cwd=project_root,
+        )
+
+        if result.returncode == 0:
+            # Parse output
+            output = result.stdout.strip()
+            logger.info(f"Subprocess reset output: {output}")
+
+            # Parse chunks_deleted from output
+            chunks_deleted = 0
+            if "chunks_deleted:" in output:
+                try:
+                    chunks_deleted = int(output.split("chunks_deleted:")[1].split()[0].strip(","))
+                except Exception:
+                    pass
+
+            return {"success": True, "chunks_deleted": chunks_deleted, "new_space": "cosine"}
+        else:
+            logger.error(f"Subprocess reset failed: {result.stderr}")
+            return {"success": False, "chunks_deleted": 0, "new_space": "cosine", "error": result.stderr}
+
+    except Exception as e:
+        logger.error(f"Subprocess execution failed: {e}")
+        return {"success": False, "chunks_deleted": 0, "new_space": "cosine", "error": str(e)}
+
+
+def reindex_all_documents() -> dict:
+    """
+    Re-index all .md files from the output directory into ChromaDB.
+
+    Use case: After resetting ChromaDB (e.g., switching distance metrics),
+    this function scans all existing documents and re-indexes them.
+
+    Returns:
+        {
+            "documents": int,      # number of documents indexed
+            "chunks": int,         # total chunks created
+            "errors": list[str],   # filenames that failed to index
+            "duration_ms": int     # total time in milliseconds
+        }
+    """
+    import os
+    from .vector_memory import get_vector_memory
+    from .tools import get_save_path
+
+    start_time = time.time()
+    logger.info("reindex_all_documents called")
+
+    vm = get_vector_memory()
+    save_path = get_save_path()
+
+    if not os.path.exists(save_path):
+        logger.warning(f"Save path not found: {save_path}")
+        return {
+            "documents": 0,
+            "chunks": 0,
+            "errors": ["Save path not found"],
+            "duration_ms": 0
+        }
+
+    md_files = sorted([f for f in os.listdir(save_path) if f.endswith(".md")])
+
+    if not md_files:
+        logger.info("No documents found to re-index")
+        return {
+            "documents": 0,
+            "chunks": 0,
+            "errors": [],
+            "duration_ms": 0
+        }
+
+    total_chunks = 0
+    errors = []
+
+    for filename in md_files:
+        filepath = os.path.join(save_path, filename)
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            # Remove metadata header if present (it's not part of the document content)
+            if content.startswith("<!--"):
+                # Find the end of the comment block
+                end_marker = content.find("-->")
+                if end_marker != -1:
+                    content = content[end_marker + 3:].strip()
+
+            chunks = vm.index_document(content, source_filename=filename)
+            total_chunks += chunks
+            logger.info(f"Indexed {filename}: {chunks} chunks")
+        except Exception as e:
+            errors.append(f"{filename}: {str(e)}")
+            logger.error(f"Failed to index {filename}: {e}")
+
+    duration_ms = int((time.time() - start_time) * 1000)
+
+    result = {
+        "documents": len(md_files) - len(errors),
+        "chunks": total_chunks,
+        "errors": errors,
+        "duration_ms": duration_ms
+    }
+
+    logger.info("reindex completed", extra={
+        "documents": result["documents"],
+        "chunks": total_chunks,
+        "errors": len(errors),
+        "duration_ms": duration_ms
+    })
+
+    return result
