@@ -13,6 +13,10 @@ langchain-core>=0.3.0           # BaseMessage, HumanMessage, AIMessage, ToolMess
 langchain-community>=0.3.0      # Chroma vector store integration (langchain_community.vectorstores)
 langchain-text-splitters>=0.3.0 # RecursiveCharacterTextSplitter
 
+# ── LangGraph (NEW - orchestration layer) ────────────────────────
+langgraph>=0.3.0                # StateGraph, Command, interrupt, checkpointer
+langgraph-checkpoint-sqlite>=3.0.0  # SqliteSaver for production persistence
+
 # ── Google Gemini integration ────────────────────────────────
 langchain-google-genai>=2.0.0   # ChatGoogleGenerativeAI — connects LangChain to Gemini
 
@@ -37,3 +41,7 @@ questionary>=2.0.0              # Interactive arrow-key terminal selection menu
 
 # ── Token counting ───────────────────────────────────────────
 tiktoken>=0.5.0                 # OpenAI tokenizer for accurate token budgeting
+
+# ── Development/Testing ──────────────────────────────────────
+pytest>=8.0.0                   # Test framework for stress tests
+pytest-mock>=3.14.0             # Mock utilities for LLM patching

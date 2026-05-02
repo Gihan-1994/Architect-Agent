@@ -2,6 +2,157 @@
 
 ---
 
+## [2026-04-30] Phase 4: Dispatcher + UI Integration (HITL)
+
+---
+
+### 1. `agent/dispatcher.py` — LangGraph dispatcher support
+
+- **Why:** Needed entry point for LangGraph mode with HITL approval workflow
+- **How:**
+  - Added imports: uuid, HumanMessage, AIMessage, Command, LangGraphArchitect
+  - Added session state: `_langgraph_architect`, `_current_thread_id`
+  - Added `_get_langgraph_architect()` singleton getter
+  - Added `_get_thread_id()` for collision prevention (terminal_{uuid}, web_{session})
+  - Added `agentic_action_langgraph()`:
+    - Creates/resumes LangGraph session with thread_id
+    - Handles HITL interrupt → returns needs_approval=True
+    - Handles resume_approval with approval_decision
+    - Returns dict: thread_id, response, needs_approval, tool_name
+  - Added `get_interrupted_state()` for debugging pending interrupts
+
+---
+
+### 2. `main.py` — CLI LangGraph mode support
+
+- **Why:** Terminal users needed HITL approval prompts for save/update operations
+- **How:**
+  - Added `agentic_action_langgraph` import
+  - Added `_current_thread_id`, `_use_langgraph` state variables
+  - Added `/langgraph` command to toggle mode
+  - Modified conversation loop:
+    - If LangGraph mode: call `agentic_action_langgraph()`
+    - If `needs_approval`: prompt "Approve? [y/n]"
+    - Resume with approval_decision based on user input
+
+---
+
+### 3. `app.py` — Gradio web UI LangGraph mode support
+
+- **Why:** Web users needed HITL approval buttons for save/update operations
+- **How:**
+  - Added `agentic_action_langgraph` import
+  - Added `_session_thread_id`, `_pending_approval` state
+  - Modified `chat()`:
+    - Added `use_langgraph` parameter
+    - If LangGraph mode: call `agentic_action_langgraph()`
+    - If `needs_approval`: return approval_row visible
+  - Added `handle_approval(approved, history)`:
+    - Resumes LangGraph with approval_decision
+    - Updates chat with result + status message
+  - Added UI components:
+    - LangGraph toggle checkbox with info text
+    - Approval buttons row (hidden by default)
+  - Updated event wiring:
+    - send_btn/msg_box: pass langgraph_toggle, return approval_row
+    - approve_btn/reject_btn: call handle_approval()
+
+---
+
+### 4. `tests/test_langgraph_stress.py` — NEW stress test file (400+ lines)
+
+- **Why:** Validate edge cases identified in LangGraph master plan stress test analysis
+- **How:**
+  - Created tests/ directory
+  - Added pytest dependencies to requirements.txt
+  - Implemented 10 test cases covering:
+    - Test 1: Interrupt timeout (5-minute auto-cancel)
+    - Test 2: Resume with wrong thread_id
+    - Test 3: Grade node LLM failure (TimeoutError, malformed response)
+    - Test 4: Rewrite identical query (no infinite loop)
+    - Test 5: Multiple tool calls (sequential execution)
+    - Test 6: State persistence after restart (SqliteSaver)
+    - Test 7: Concurrent sessions collision
+    - Test 8: Token budget exhaustion (MAX_RAG_TOKENS=4000)
+    - Test 9: pending_tool None handling
+    - Test 10: Empty chunks fallback (full document load)
+  - Used pytest fixtures: architect, architect_with_self_rag, temp_checkpointer
+  - Used unittest.mock.patch for LLM mocking
+
+---
+
+### 5. `requirements.txt` — Added pytest dependencies (lines 46-47)
+
+- **Why:** Test framework needed for stress test execution
+- **How:**
+  - Added: `pytest>=8.0.0` (test framework)
+  - Added: `pytest-mock>=3.14.0` (mock utilities)
+
+---
+
+## [2026-04-27] Phase 3: LangGraph Orchestration Layer Implementation
+
+---
+
+### 1. `agent/langgraph_architect.py` — NEW file (500+ lines)
+
+- **Why:** Replace manual ReAct loop with LangGraph StateGraph for:
+  - Declarative node-based flow
+  - interrupt() for Human-in-the-Loop approval
+  - SqliteSaver for state persistence (survives restart)
+  - Self-RAG pattern (grade → rewrite → retrieve)
+- **How:**
+  - Created ArchitectState TypedDict with stress test fields:
+    - messages, retrieved_chunks, query_iterations
+    - pending_tools (list for multiple tool support)
+    - current_tool_index, interrupt_timestamp, token_count
+    - retrieval_mode, enable_grading, enable_rewrite
+  - Implemented 7 nodes:
+    - _retrieve_node: MMR search + cosine threshold filtering
+    - _grade_node: LLM validates chunk relevance (configurable)
+    - _rewrite_node: Query reformulation (configurable)
+    - _agent_node: LLM with tools + token budget + message pruning
+    - _approval_node: HITL with 5-minute timeout + None handling
+    - _execute_node: Iterates through pending_tools list
+    - _cancel_node: User rejection handler
+  - Added configurable Self-RAG (enable_grading=False, enable_rewrite=False by default)
+  - Used SqliteSaver checkpointer for production persistence
+  - Added routing functions: _route_after_retrieve, _route_has_tool
+
+---
+
+### 2. `agent/__init__.py` — Added LangGraph exports (lines 16-18, 35-37)
+
+- **Why:** Expose LangGraph module for use in dispatcher and UI
+- **How:**
+  - Added import: `from .langgraph_architect import get_langgraph_architect, LangGraphArchitect`
+  - Added to __all__: `"get_langgraph_architect", "LangGraphArchitect"`
+
+---
+
+### 3. `requirements.txt` — Added dependencies (lines 17-18)
+
+- **Why:** LangGraph and SqliteSaver require separate packages
+- **How:**
+  - Added: `langgraph>=0.3.0` (StateGraph, Command, interrupt)
+  - Added: `langgraph-checkpoint-sqlite>=3.0.0` (SqliteSaver for persistence)
+
+---
+
+### 4. `CLAUDE.md` — Updated indexes (lines 88-96, 75-84, 130-136)
+
+- **Why:** Documentation must reflect current architecture after Phase 1-3 changes
+- **How:**
+  - Updated Agent Package Structure: added `langgraph_architect.py`, `hierarchical_memory.py`
+  - Updated Memory System: changed from "Two-Layer" to "Three-Layer Memory System"
+    - Added Hierarchical layer: Parent-child retrieval for full context
+  - Updated Key Technical Decisions:
+    - Changed "No LangGraph dependency" → "LangGraph orchestration: StateGraph for HITL approval + Self-RAG"
+    - Added: Semantic chunking (300 tokens, structure-aware)
+    - Added: Hierarchical retrieval (parent-child chunks)
+
+---
+
 ## [2026-04-25] LangGraph Integration Master Plan
 
 ---

@@ -83,11 +83,106 @@ from typing import List
 
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter, TokenTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter, TokenTextSplitter, MarkdownHeaderTextSplitter
 from langchain_core.documents import Document
 from chromadb.api import CreateCollectionConfiguration
 
 logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Semantic Chunking Strategy (Phase 1 from langgraph-master-plan.md)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SemanticChunkingStrategy:
+    """
+    Two-stage semantic chunking for architecture documents.
+
+    WHY THIS EXISTS:
+      Fixed-size chunking (500 chars) splits sentences mid-way, losing context.
+      Architecture documents have natural structure (## headers) that should be
+      preserved for better retrieval.
+
+    STAGE 1: MarkdownHeaderTextSplitter splits by structure (## sections)
+    STAGE 2: TokenTextSplitter splits oversized sections
+
+    RESULT: Chunks aligned with document structure, not arbitrary token limits.
+
+    Usage:
+        splitter = SemanticChunkingStrategy(max_chunk_size=300)
+        chunks = splitter.split(content, source_filename)
+    """
+
+    def __init__(self, max_chunk_size: int = 300):
+        """
+        Args:
+            max_chunk_size: Maximum tokens per chunk (default 300).
+                            Sections larger than this are split further.
+        """
+        # Stage 1: Structure-aware splitting
+        self.header_splitter = MarkdownHeaderTextSplitter(
+            headers_to_split_on=[
+                ('#', 'document_title'),
+                ('##', 'section'),
+                ('###', 'subsection'),
+            ],
+            strip_headers=False,  # Keep headers for context
+        )
+
+        # Stage 2: Size limiting (for oversized sections)
+        self.size_splitter = TokenTextSplitter(
+            encoding_name="cl100k_base",
+            chunk_size=max_chunk_size,
+            chunk_overlap=50,
+        )
+
+    def split(self, content: str, source_filename: str) -> List[Document]:
+        """
+        Split markdown content into semantic chunks with section metadata.
+
+        Args:
+            content: Raw markdown text
+            source_filename: Filename for metadata
+
+        Returns:
+            List of Document objects with enriched metadata:
+                - source: filename
+                - document_title: from # header
+                - section: from ## header
+                - subsection: from ### header
+        """
+        # Stage 1: Split by headers
+        try:
+            header_chunks = self.header_splitter.split_text(content)
+        except Exception as e:
+            logger.warning(f"Header splitting failed: {e}, using fallback")
+            # Fallback to simple split if markdown parsing fails
+            return [Document(
+                page_content=content,
+                metadata={"source": source_filename}
+            )]
+
+        # Stage 2: Further split oversized chunks + enrich metadata
+        final_chunks = []
+        for chunk in header_chunks:
+            # Extract metadata from chunk
+            section_meta = chunk.metadata.copy()
+            section_meta["source"] = source_filename
+
+            if len(chunk.page_content) > self.size_splitter._chunk_size:
+                sub_chunks = self.size_splitter.split_text(chunk.page_content)
+                for sub in sub_chunks:
+                    final_chunks.append(Document(
+                        page_content=sub,
+                        metadata=section_meta,
+                    ))
+            else:
+                final_chunks.append(Document(
+                    page_content=chunk.page_content,
+                    metadata=section_meta,
+                ))
+
+        return final_chunks
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -145,11 +240,13 @@ class VectorMemory:
             encode_kwargs={"normalize_embeddings": True},  # normalise for cosine similarity
         )
 
-        # ── 2. Text Splitter ──────────────────────────────────────────────
-        # Try TokenTextSplitter (requires tiktoken) for accurate token-based chunks.
-        # Fallback to RecursiveCharacterTextSplitter if tiktoken not installed.
+        # ── 2. Text Splitters ──────────────────────────────────────────────
+        # NEW: Semantic chunking for structure-aware splitting (Phase 1)
+        self._semantic_splitter = SemanticChunkingStrategy(max_chunk_size=300)
+
+        # Fallback splitter for non-markdown content
         try:
-            self._splitter = TokenTextSplitter(
+            self._fallback_splitter = TokenTextSplitter(
                 encoding_name="cl100k_base",  # GPT-4 encoding (good approximation)
                 chunk_size=500,
                 chunk_overlap=100,
@@ -161,7 +258,7 @@ class VectorMemory:
                 "tiktoken not installed, falling back to RecursiveCharacterTextSplitter. "
                 "Token budgets will be approximate. Install tiktoken for accurate chunking."
             )
-            self._splitter = RecursiveCharacterTextSplitter(
+            self._fallback_splitter = RecursiveCharacterTextSplitter(
                 chunk_size=500,      # characters (approximate)
                 chunk_overlap=100,
                 length_function=len,
@@ -180,13 +277,11 @@ class VectorMemory:
         """
         Split a document into chunks, embed each chunk, and store in ChromaDB.
 
-        Call this every time a new .md file is saved.
+        CHANGED (Phase 1):
+            - Uses SemanticChunkingStrategy for structure-aware splitting
+            - Enriches metadata with 8 fields per langgraph-master-plan.md
 
-        Pseudocode:
-            1. Split content into overlapping 500-char chunks
-            2. Tag every chunk with {"source": source_filename} as metadata
-            3. Add all chunks to ChromaDB (it embeds them automatically)
-            4. Return the number of chunks created
+        Call this every time a new .md file is saved.
 
         Args:
             content:         The raw markdown text of the saved document.
@@ -200,21 +295,34 @@ class VectorMemory:
         start_time = time.time()
         logger.info("index_document called", extra={"saved_file": source_filename})
 
-        # Step 1 & 2: Split the document into chunks with metadata
+        # Step 1 & 2: Split the document using semantic chunking
         split_start = time.time()
-        chunks: List[Document] = self._splitter.create_documents(
-            texts=[content],
-            metadatas=[{"source": source_filename}],
-        )
+
+        # NEW: Use semantic splitter for markdown files
+        if source_filename.endswith('.md'):
+            chunks: List[Document] = self._semantic_splitter.split(content, source_filename)
+        else:
+            # Fallback for non-markdown files
+            chunks = self._fallback_splitter.create_documents(
+                texts=[content],
+                metadatas=[{"source": source_filename}],
+            )
+
         split_duration = int((time.time() - split_start) * 1000)
 
         if not chunks:
             logger.warning("No chunks created from document")
             return 0
 
+        # Step 3: NEW - Enrich metadata with additional fields
+        for i, chunk in enumerate(chunks):
+            chunk.metadata["chunk_index"] = i
+            chunk.metadata["chunk_type"] = self._classify_chunk_type(chunk.page_content)
+            chunk.metadata["token_count"] = self._count_tokens(chunk.page_content)
+
         logger.debug(f"Document split into {len(chunks)} chunks", extra={"chunks": len(chunks), "duration_ms": split_duration})
 
-        # Step 3: Store in ChromaDB
+        # Step 4: Store in ChromaDB
         store_start = time.time()
         store = self._get_store()
         store.add_documents(chunks)
@@ -224,6 +332,46 @@ class VectorMemory:
         logger.info("index_document completed", extra={"saved_file": source_filename, "chunks": len(chunks), "duration_ms": total_duration})
 
         return len(chunks)
+
+    def _classify_chunk_type(self, content: str) -> str:
+        """
+        Classify chunk as prose, code, table, or diagram.
+
+        NEW (Phase 1): Part of metadata enrichment.
+
+        Args:
+            content: Chunk text content
+
+        Returns:
+            One of: "prose", "code", "table", "diagram"
+        """
+        if content.strip().startswith('```'):
+            return "code"
+        elif content.strip().startswith('|') or '---' in content[:50]:
+            return "table"
+        elif 'mermaid' in content.lower() or 'graph' in content.lower():
+            return "diagram"
+        return "prose"
+
+    def _count_tokens(self, text: str) -> int:
+        """
+        Centralized token counting.
+
+        NEW (Phase 1): Used for metadata enrichment and token budgets.
+
+        Args:
+            text: Text to count tokens in
+
+        Returns:
+            Approximate token count
+        """
+        try:
+            import tiktoken
+            enc = tiktoken.get_encoding("cl100k_base")
+            return len(enc.encode(text))
+        except ImportError:
+            # Approximate: 4 chars per token
+            return len(text) // 4
 
     def search(self, query: str, k: int = 3) -> List[Document]:
         """
@@ -511,6 +659,94 @@ class VectorMemory:
             k=k,
             filter={"source": source_filename},
         )
+
+    def search_by_section(
+        self,
+        query: str,
+        section: str | List[str],
+        k: int = 5,
+    ) -> List[tuple]:
+        """
+        Search within specific document sections.
+
+        NEW (Phase 1): Part of metadata-enriched retrieval.
+
+        Args:
+            query: Search query
+            section: Section name or list of section names
+            k: Number of results (default 5)
+
+        Returns:
+            Chunks from specified sections, with scores
+        """
+        if isinstance(section, str):
+            filter_dict = {"section": section}
+        else:
+            filter_dict = {"section": {"$or": section}}
+
+        return self.similarity_search_mmr_with_score(
+            query=query,
+            k=k,
+            filter=filter_dict,
+        )
+
+    def search_with_chunk_type_preference(
+        self,
+        query: str,
+        prefer_types: List[str] = ["prose"],
+        k: int = 5,
+    ) -> List[tuple]:
+        """
+        Search prioritizing certain chunk types.
+
+        NEW (Phase 1): Part of metadata-enriched retrieval.
+
+        Args:
+            query: Search query
+            prefer_types: List of chunk types to prefer (default: ["prose"])
+                          Options: "prose", "code", "table", "diagram"
+            k: Number of results (default 5)
+
+        Returns:
+            Chunks of preferred types, with scores
+        """
+        return self.similarity_search_mmr_with_score(
+            query=query,
+            k=k,
+            filter={"chunk_type": {"$or": prefer_types}},
+        )
+
+    def get_full_document_by_source(self, source_filename: str) -> str | None:
+        """
+        Load entire document content regardless of token count.
+
+        NEW (Phase 1): Used for full document fallback when chunks are empty
+        (stress test issue 2.1).
+
+        Args:
+            source_filename: Filename to load
+
+        Returns:
+            Full document content, or None if not found
+        """
+        try:
+            store = self._get_store()
+
+            # Get all chunks for this source
+            results = store.get(
+                where={"source": source_filename},
+            )
+
+            if not results.get("documents"):
+                return None
+
+            # Combine all chunks into full document
+            full_content = "\n\n".join(results["documents"])
+            return full_content
+
+        except Exception as e:
+            logger.error(f"Failed to load full document {source_filename}: {e}")
+            return None
 
     def delete_by_source(self, source_filename: str) -> int:
         """

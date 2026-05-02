@@ -22,14 +22,15 @@ import sys
 import argparse
 import questionary
 from dotenv import load_dotenv
-
-# Load .env file (must happen before importing agent, which reads env vars)
-load_dotenv()
-
 from agent import (
     agentic_action, reset_conversation, get_token_estimate, get_exact_token_count, set_save_path,
     list_available_models, init_architect, switch_model, setup_logging,
+    agentic_action_langgraph,
 )
+# Load .env file (must happen before importing agent, which reads env vars)
+load_dotenv()
+
+
 
 # ── Initialize logging ─────────────────────────────────────────────────────
 # Set debug=False for INFO level (normal operation)
@@ -37,6 +38,8 @@ from agent import (
 setup_logging(debug=True)
 
 DEFAULT_MODEL = "gemini-3.1-flash-lite-preview"
+_current_thread_id: str | None = None
+_use_langgraph = False  # Toggle between original and LangGraph mode
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -89,7 +92,7 @@ def print_banner(model: str) -> None:
 ║    • Database Schemas / ERDs (Mermaid)                     ║
 ║    • Sequence / Flow Diagrams (Mermaid)                    ║
 ╠════════════════════════════════════════════════════════════╣
-║  Commands: /clear  /tokens  /docs  /quit  /models          ║
+║  Commands: /clear  /tokens  /docs  /quit  /models  /langgraph ║
 ║                                                            ║
 ╚════════════════════════════════════════════════════════════╝
 """)
@@ -123,6 +126,15 @@ def handle_command(cmd: str) -> bool:
         chosen = pick_model()
         switch_model(chosen)
         print(f"✅ Model switched to: {chosen}\n")
+        return True
+
+    if cmd_lower == "/langgraph":
+        global _use_langgraph
+        _use_langgraph = not _use_langgraph
+        status = "ENABLED" if _use_langgraph else "DISABLED"
+        print(f"✅ LangGraph mode: {status}\n")
+        if _use_langgraph:
+            print("   Features: HITL approval, state persistence, Self-RAG\n")
         return True
 
     if cmd_lower == "/quit":
@@ -206,7 +218,42 @@ def main() -> None:
 
             # Send to the agent
             print("\n🤔 Thinking...\n")
-            response = agentic_action(user_input)
+
+            if _use_langgraph:
+                # LangGraph mode with HITL support
+                global _current_thread_id
+                result = agentic_action_langgraph(user_input, thread_id=_current_thread_id)
+                _current_thread_id = result["thread_id"]
+
+                if result["needs_approval"]:
+                    # Human-in-the-Loop approval prompt
+                    tool = result["tool_name"]
+                    print(f"\n⚠️  Approval needed: {tool}")
+                    print("   This will save/modify a document.")
+                    approval = input("   Approve? [y/n]: ").strip().lower()
+
+                    if approval in ["y", "yes"]:
+                        print("\n✅ Approved. Executing...\n")
+                        result = agentic_action_langgraph(
+                            "",
+                            thread_id=_current_thread_id,
+                            resume_approval=True,
+                            approval_decision=True,
+                        )
+                    else:
+                        print("\n❌ Rejected. Cancelling operation.\n")
+                        result = agentic_action_langgraph(
+                            "",
+                            thread_id=_current_thread_id,
+                            resume_approval=True,
+                            approval_decision=False,
+                        )
+
+                response = result["response"]
+            else:
+                # Original mode (backward compatible)
+                response = agentic_action(user_input)
+
             print(f"🏗️  Architect: {response}\n")
             print("─" * 60)
 

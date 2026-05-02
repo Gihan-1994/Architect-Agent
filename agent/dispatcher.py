@@ -42,8 +42,12 @@ import time
 import logging
 import subprocess
 import sys
+import uuid
 from typing import Optional
 from .architect import SoftwareArchitectAgent
+from .langgraph_architect import LangGraphArchitect, get_langgraph_architect
+from langchain_core.messages import HumanMessage, AIMessage
+from langgraph.types import Command
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +58,8 @@ logger = logging.getLogger(__name__)
 # conversation memory is shared across all calls in one session.
 # ─────────────────────────────────────────────────────────────────────────────
 _architect: Optional[SoftwareArchitectAgent] = None
+_langgraph_architect: Optional[LangGraphArchitect] = None
+_current_thread_id: Optional[str] = None
 
 
 def _get_architect() -> SoftwareArchitectAgent:
@@ -66,6 +72,188 @@ def _get_architect() -> SoftwareArchitectAgent:
     if _architect is None:
         _architect = SoftwareArchitectAgent()
     return _architect
+
+
+def _get_langgraph_architect() -> LangGraphArchitect:
+    """
+    Lazy-load the LangGraph architect singleton.
+    Returns the instance with default Self-RAG disabled.
+    """
+    global _langgraph_architect
+    if _langgraph_architect is None:
+        _langgraph_architect = get_langgraph_architect()
+    return _langgraph_architect
+
+
+def _get_thread_id(source: str = "terminal") -> str:
+    """
+    Generate unique thread_id for LangGraph state isolation.
+
+    Thread ID collision prevention:
+        - Terminal: "terminal_{uuid}"
+        - Web UI: "web_{user_id}_{session_id}"
+
+    Args:
+        source: "terminal" or "web"
+
+    Returns:
+        Unique thread_id string
+    """
+    global _current_thread_id
+
+    if source == "terminal":
+        _current_thread_id = f"terminal_{uuid.uuid4()}"
+
+    return _current_thread_id
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LangGraph Entry Point (Phase 4)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def agentic_action_langgraph(
+    user_message: str,
+    thread_id: str | None = None,
+    resume_approval: bool = False,
+    approval_decision: bool | None = None,
+) -> dict:
+    """
+    LangGraph-based entry point with HITL support (Phase 4).
+
+    Features:
+        - HITL approval via interrupt() for save_document/update_document
+        - State persistence via SqliteSaver
+        - Self-RAG (configurable, disabled by default)
+        - Multiple tool support
+
+    Args:
+        user_message: User input text
+        thread_id: Optional thread for state continuity (auto-generated if None)
+        resume_approval: True if resuming after approval prompt
+        approval_decision: True=approve, False=reject (only used when resume_approval=True)
+
+    Returns:
+        {
+            "response": str,           # Agent's text response
+            "needs_approval": bool,    # True if waiting for user approval
+            "tool_name": str | None,   # Tool awaiting approval
+            "thread_id": str,          # Thread ID for resume
+        }
+    """
+    start_time = time.time()
+    architect = _get_langgraph_architect()
+
+    # Generate thread_id if not provided
+    if thread_id is None:
+        thread_id = _get_thread_id("terminal")
+
+    config = {"configurable": {"thread_id": thread_id}}
+
+    # Log entry
+    msg_preview = user_message[:50] + "..." if len(user_message) > 50 else user_message
+    logger.info(f"LangGraph request: '{msg_preview}'", extra={"thread_id": thread_id})
+
+    try:
+        if resume_approval:
+            # Resume after user approved/rejected
+            if approval_decision is None:
+                # Default to approve if not specified
+                approval_decision = True
+
+            # Resume with decision
+            result = architect.invoke(
+                Command(resume=approval_decision),
+                config
+            )
+        else:
+            # New request - initialize state
+            result = architect.invoke(
+                {
+                    "messages": [HumanMessage(content=user_message)],
+                    "retrieved_chunks": [],
+                    "query_iterations": 0,
+                    "pending_tools": None,
+                    "current_tool_index": 0,
+                    "interrupt_timestamp": None,
+                    "token_count": 0,
+                    "retrieval_mode": "standard",
+                    "enable_grading": False,
+                    "enable_rewrite": False,
+                    "last_query_source": None,
+                },
+                config
+            )
+
+        # Check if graph is interrupted (waiting for approval)
+        state = architect.get_state(config)
+
+        # Check for pending approval
+        needs_approval = False
+        tool_name = None
+
+        if state and state.values.get("pending_tools"):
+            pending = state.values["pending_tools"]
+            idx = state.values.get("current_tool_index", 0)
+            if pending and idx < len(pending):
+                current_tool = pending[idx]
+                if current_tool["name"] in ["save_document", "update_document"]:
+                    needs_approval = True
+                    tool_name = current_tool["name"]
+
+        # Extract final message
+        messages = result.get("messages", [])
+        response_text = ""
+
+        if messages:
+            last_msg = messages[-1]
+            if isinstance(last_msg, AIMessage):
+                response_text = last_msg.content
+            elif hasattr(last_msg, "content"):
+                response_text = str(last_msg.content)
+
+        duration_ms = int((time.time() - start_time) * 1000)
+        logger.info("LangGraph response", extra={
+            "duration_ms": duration_ms,
+            "needs_approval": needs_approval,
+            "thread_id": thread_id,
+        })
+
+        return {
+            "response": response_text,
+            "needs_approval": needs_approval,
+            "tool_name": tool_name,
+            "thread_id": thread_id,
+        }
+
+    except Exception as e:
+        logger.error(f"LangGraph error: {e}")
+        return {
+            "response": f"Error: {str(e)}",
+            "needs_approval": False,
+            "tool_name": None,
+            "thread_id": thread_id,
+        }
+
+
+def get_interrupted_state(thread_id: str) -> dict | None:
+    """
+    Get the current interrupted state for a thread (for HITL resume).
+
+    Args:
+        thread_id: Thread to check
+
+    Returns:
+        State dict if interrupted, None if not
+    """
+    architect = _get_langgraph_architect()
+    config = {"configurable": {"thread_id": thread_id}}
+
+    try:
+        state = architect.get_state(config)
+        return state.values if state else None
+    except Exception as e:
+        logger.warning(f"Could not get state for thread {thread_id}: {e}")
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────

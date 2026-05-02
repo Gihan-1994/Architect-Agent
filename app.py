@@ -24,11 +24,12 @@ INTERFACE LAYOUT:
 import os
 import gradio as gr
 from dotenv import load_dotenv
-
+from agent import agentic_action, reset_conversation, get_token_estimate, get_exact_token_count, set_save_path, get_save_path, setup_logging
+from agent import agentic_action_langgraph
 # Load environment variables before importing the agent
 load_dotenv()
 
-from agent import agentic_action, reset_conversation, get_token_estimate, get_exact_token_count, set_save_path, get_save_path, setup_logging
+
 
 # ── Initialize logging ─────────────────────────────────────────────────────
 # Set debug=False for INFO level (normal operation)
@@ -42,6 +43,10 @@ setup_logging(debug=False)
 DEFAULT_SAVE_PATH = "./output"
 set_save_path(DEFAULT_SAVE_PATH)
 
+# LangGraph session state
+_session_thread_id: str | None = None
+_pending_approval: dict | None = None
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Event Handlers
@@ -51,6 +56,7 @@ def chat(
     user_message: str,
     history: list,
     save_path: str,
+    use_langgraph: bool = False,
 ) -> tuple:
     """
     Handle a single chat turn from the Gradio UI.
@@ -59,12 +65,15 @@ def chat(
         user_message: What the user typed.
         history:      Gradio chat history — list of [user_msg, bot_msg] pairs.
         save_path:    Directory to save documents (from the settings panel).
+        use_langgraph: Enable LangGraph mode with HITL approval.
 
     Returns:
-        ("", updated_history) — clears the input box and updates the chat.
+        ("", updated_history, approval_visible) — clears input, updates chat, shows/hides approval.
     """
+    global _session_thread_id, _pending_approval
+
     if not user_message.strip():
-        return "", history
+        return "", history, gr.update(visible=False)
 
     # Update save path if the user changed it in the settings panel
     current_path = get_save_path()
@@ -72,18 +81,76 @@ def chat(
         set_save_path(save_path.strip())
 
     # Call the agent
-    response = agentic_action(user_message)
+    if use_langgraph:
+        # LangGraph mode with HITL support
+        result = agentic_action_langgraph(user_message, thread_id=_session_thread_id)
+        _session_thread_id = result["thread_id"]
+
+        if result["needs_approval"]:
+            # Store pending approval for later resume
+            _pending_approval = result
+
+            # Show approval prompt in chat
+            tool = result.get("tool_name", "unknown")
+            approval_msg = (
+                f"⚠️ **Approval Needed**: `{tool}`\n\n"
+                f"This will save or modify a document.\n\n"
+                f"Click **Approve** or **Reject** below to continue."
+            )
+            history.append([user_message, approval_msg])
+            return "", history, gr.update(visible=True)  # Show approval buttons
+
+        response = result["response"]
+    else:
+        # Original mode (backward compatible)
+        response = agentic_action(user_message)
 
     # Append to Gradio history format: [[user, bot], ...]
     history.append([user_message, response])
 
-    return "", history  # "" clears the input box
+    return "", history, gr.update(visible=False)  # Hide approval buttons
 
 
 def clear_chat() -> list:
     """Reset conversation history and return an empty chat history."""
     reset_conversation()
+    global _session_thread_id, _pending_approval
+    _session_thread_id = None
+    _pending_approval = None
     return []
+
+
+def handle_approval(approved: bool, history: list) -> tuple:
+    """
+    Handle approval decision from UI buttons.
+
+    Args:
+        approved: True = approve, False = reject
+        history: Current chat history
+
+    Returns:
+        (updated_history, approval_visible) — updates chat and hides buttons.
+    """
+    global _pending_approval, _session_thread_id
+
+    if _pending_approval:
+        result = agentic_action_langgraph(
+            "",
+            thread_id=_session_thread_id,
+            resume_approval=True,
+            approval_decision=approved,
+        )
+
+        if approved:
+            status_msg = "✅ **Approved**. Executing operation..."
+        else:
+            status_msg = "❌ **Rejected**. Cancelling operation."
+
+        # Update chat with result
+        history.append([None, status_msg + "\n\n" + result["response"]])
+        _pending_approval = None
+
+    return history, gr.update(visible=False)  # Hide approval buttons
 
 
 def update_token_display() -> str:
@@ -177,6 +244,18 @@ with gr.Blocks(
                 )
                 send_btn = gr.Button("Send ▶", variant="primary", scale=1, min_width=80)
 
+            # LangGraph mode toggle
+            langgraph_toggle = gr.Checkbox(
+                value=False,
+                label="🧪 LangGraph Mode (HITL approval)",
+                info="Enable for state persistence + approval prompts",
+            )
+
+            # Approval buttons (hidden by default, shown when approval needed)
+            with gr.Row(visible=False) as approval_row:
+                approve_btn = gr.Button("✅ Approve", variant="primary", scale=1)
+                reject_btn = gr.Button("❌ Reject", variant="secondary", scale=1)
+
             # Example prompts (clickable chips)
             gr.Markdown("**💡 Try these:**")
             example_btns = []
@@ -243,18 +322,30 @@ with gr.Blocks(
     # Event Wiring
     # ─────────────────────────────────────────────────────────────────────
 
-    # Send button
+    # Send button - LangGraph mode support
     send_btn.click(
         fn=chat,
-        inputs=[msg_box, chatbot, save_path_box],
-        outputs=[msg_box, chatbot],
+        inputs=[msg_box, chatbot, save_path_box, langgraph_toggle],
+        outputs=[msg_box, chatbot, approval_row],
     )
 
-    # Enter key in text box
+    # Enter key in text box - LangGraph mode support
     msg_box.submit(
         fn=chat,
-        inputs=[msg_box, chatbot, save_path_box],
-        outputs=[msg_box, chatbot],
+        inputs=[msg_box, chatbot, save_path_box, langgraph_toggle],
+        outputs=[msg_box, chatbot, approval_row],
+    )
+
+    # Approval buttons (HITL)
+    approve_btn.click(
+        fn=lambda h: handle_approval(True, h),
+        inputs=[chatbot],
+        outputs=[chatbot, approval_row],
+    )
+    reject_btn.click(
+        fn=lambda h: handle_approval(False, h),
+        inputs=[chatbot],
+        outputs=[chatbot, approval_row],
     )
 
     # Clear conversation
